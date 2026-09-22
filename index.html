@@ -2559,6 +2559,11 @@ try{
 
   var walletWidget = document.getElementById('walletWidget');
 
+  // Async functions declared inside this try block stay block-scoped, so the
+  // apply page's script (a separate <script>) can't see connectWallet unless
+  // it's exposed explicitly.
+  window.connectWallet = connectWallet;
+
   if(walletConnectBtn){
     walletConnectBtn.addEventListener('click', connectWallet);
   }
@@ -2685,7 +2690,7 @@ try{
 </script>
 
 <script type="module">
-import { Connection, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL, clusterApiUrl } from '@solana/web3.js';
+import { Connection, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import QRCode from 'qrcode';
 
 try{
@@ -2694,7 +2699,27 @@ try{
   var RECEIVING_ADDRESS = 'EVACSTzxhHzD7Wa45zjZUaBTqaEq7iVEG7fwr14kVX5k';
   var USD_AMOUNT = 25;
 
-  var connection = new Connection(clusterApiUrl(PAY_CLUSTER), 'confirmed');
+  // The official public endpoint (clusterApiUrl) answers browser requests
+  // with 403, so use RPCs that allow them, falling back in order.
+  var RPC_URLS = [
+    'https://solana-rpc.publicnode.com',
+    'https://solana-mainnet.gateway.tatum.io'
+  ];
+  var connections = RPC_URLS.map(function(url){ return new Connection(url, 'confirmed'); });
+  var connection = connections[0];
+
+  // Runs fn against each RPC until one succeeds; later calls reuse the winner.
+  async function withRpc(fn){
+    var lastErr;
+    for(var i = 0; i < connections.length; i++){
+      try{
+        var result = await fn(connections[i]);
+        connection = connections[i];
+        return result;
+      }catch(err){ lastErr = err; }
+    }
+    throw lastErr;
+  }
   var solPrice = null;
   var solAmount = null;
   var lastTxSignature = null;
@@ -2741,11 +2766,30 @@ try{
     });
   }
 
+  // CoinGecko's free API rate-limits often (and then fails CORS), so try
+  // several price sources in order until one returns a usable number.
+  var PRICE_SOURCES = [
+    { url: 'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', read: function(d){ return d.solana && d.solana.usd; } },
+    { url: 'https://api.coinbase.com/v2/prices/SOL-USD/spot', read: function(d){ return d.data && d.data.amount; } },
+    { url: 'https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', read: function(d){ return d.price; } },
+    { url: 'https://api.kraken.com/0/public/Ticker?pair=SOLUSD', read: function(d){ return d.result && d.result.SOLUSD && d.result.SOLUSD.c[0]; } }
+  ];
+
+  async function fetchSolPrice(){
+    for(var i = 0; i < PRICE_SOURCES.length; i++){
+      try{
+        var res = await fetch(PRICE_SOURCES[i].url);
+        if(!res.ok) continue;
+        var price = Number(PRICE_SOURCES[i].read(await res.json()));
+        if(price > 0) return price;
+      }catch(_e){}
+    }
+    return null;
+  }
+
   async function loadSolPrice(){
     try{
-      var res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
-      var data = await res.json();
-      solPrice = data && data.solana && data.solana.usd ? data.solana.usd : null;
+      solPrice = await fetchSolPrice();
       if(solPrice){
         solAmount = Number((USD_AMOUNT / solPrice).toFixed(4));
         if(paySolLabel) paySolLabel.textContent = '≈ ' + solAmount + ' SOL';
@@ -2824,7 +2868,7 @@ try{
       var lamports = Math.round(solAmount * LAMPORTS_PER_SOL);
 
       var tx = new Transaction().add(SystemProgram.transfer({ fromPubkey: fromPubkey, toPubkey: toPubkey, lamports: lamports }));
-      var latest = await connection.getLatestBlockhash();
+      var latest = await withRpc(function(c){ return c.getLatestBlockhash(); });
       tx.recentBlockhash = latest.blockhash;
       tx.feePayer = fromPubkey;
 
@@ -2834,7 +2878,7 @@ try{
         signature = sent.signature || sent;
       } else if(typeof activeProvider.signTransaction === 'function'){
         var signed = await activeProvider.signTransaction(tx);
-        signature = await connection.sendRawTransaction(signed.serialize());
+        signature = await withRpc(function(c){ return c.sendRawTransaction(signed.serialize()); });
       } else {
         throw new Error('Wallet does not support signing transactions');
       }
